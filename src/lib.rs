@@ -1,5 +1,7 @@
 use sha2::{Digest, Sha256};
 
+pub mod ignore;
+pub mod pathutil;
 pub mod proto;
 pub mod transport;
 pub mod write;
