@@ -205,7 +205,7 @@ where
 
                 let sig = Signature::deserialize(&signature)?;
                 let mut delta = Vec::new();
-                diff(&sig.index(), &mmap, &mut delta)?;
+                diff(&sig.index(), mmap, &mut delta)?;
 
                 proto::TransferRequest {
                     id: Uuid::new_v4(),
