@@ -10,6 +10,7 @@ atty = "0.2.14"
 bytes = "1.1.0"
 fast_rsync = { git = "https://github.com/dropbox/fast_rsync" }
 futures-util = { version = "0.3.17", features = ["io"] }
+hex = "0.4.3"
 ignore = "0.4.18"
 memchr = "2.4.1"
 memmap2 = "0.5.0"
@@ -19,11 +20,14 @@ serde = { version = "1.0.130", features = ["derive"] }
 serde_json = "1.0.68"
 sha2 = "0.9.8"
 sha256 = "1.0.2"
-tokio = { version = "1.12.0", features = ["macros", "process", "rt-multi-thread", "sync", "io-std", "fs", "io-util"] }
+tokio = { version = "1.12.0", features = ["macros", "process", "rt-multi-thread", "sync", "io-std", "fs", "io-util", "net"] }
 tokio-serde = { version = "0.8.0", features = ["json", "bincode"] }
-tokio-tower = "0.6.0"
+# tokio-tower = "0.6.0"
+tokio-tower = { path = "../../src/tokio-tower" }
 tokio-util = { version = "0.6.8", features = ["io", "codec"] }
 tower = { version = "0.4.10", features = ["util"] }
 tracing = "0.1.29"
 tracing-subscriber = { version = "0.3.1", features = ["env-filter"] }
 uuid = { version = "0.8.2", features = ["v4", "serde"] }
+
+[features]

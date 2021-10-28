@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 use futures_util::{Sink, Stream};
 use pin_project::pin_project;
@@ -84,7 +84,8 @@ where
         self.project().sink.poll_flush(cx)
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.as_mut().poll_flush(cx))?;
         self.project().sink.poll_close(cx)
     }
 }

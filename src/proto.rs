@@ -1,3 +1,4 @@
+use std::fmt::{self, Debug};
 use std::path::PathBuf;
 use std::{fs, io};
 
@@ -39,6 +40,8 @@ pub enum TransferRequestKind {
     Check,
     Delta,
     Contents,
+    Remove,
+    Rename { new_path: PathBuf },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -49,9 +52,8 @@ pub struct TransferResponse {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum TransferResponseKind {
-    Created,
-    Exists,
-    ExistsDifferent { signature: Vec<u8> },
+    Ok,
+    Different { signature: Vec<u8> },
     NeedContents,
     CantHandle { reason: String },
 }
@@ -64,12 +66,29 @@ impl From<io::Error> for TransferResponseKind {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct Transfer {
     pub kind: TransferKind,
+    /// Data of a chunk
     pub data: Vec<u8>,
+    /// Sha256 sum of the file
     pub shasum: [u8; 32],
-    pub len: Option<usize>,
+    /// Total size of the file in bytes
+    pub file_size: Option<usize>,
+    /// Total size of the data
+    pub data_size: Option<usize>,
+}
+
+impl Debug for Transfer {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Transfer")
+            .field("kind", &self.kind)
+            .field("data", &"[...]")
+            .field("shasum", &hex::encode(&self.shasum))
+            .field("file_size", &self.file_size)
+            .field("data_size", &self.data_size)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

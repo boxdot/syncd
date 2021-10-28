@@ -1,10 +1,17 @@
+use std::pin::Pin;
+
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod ignore;
 pub mod pathutil;
 pub mod proto;
+pub mod store;
 pub mod transport;
 pub mod write;
+
+pub type BoxAsynWrite = Pin<Box<dyn AsyncWrite + Send + Sync>>;
+pub type BoxAsynRead = Pin<Box<dyn AsyncRead + Send + Sync>>;
 
 pub fn init<A: argh::TopLevelCommand>() -> A {
     if std::env::var("RUST_LOG").is_err() {

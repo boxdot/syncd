@@ -8,27 +8,37 @@ use anyhow::{anyhow, bail, Context as _};
 use argh::FromArgs;
 use fast_rsync::{diff, Signature};
 use futures_util::future::poll_fn;
-use ignore::{DirEntry, Walk};
-use memmap2::MmapOptions;
-use notify::{EventKind, RecursiveMode, Watcher};
+use ignore::{DirEntry, WalkBuilder};
+use memmap2::{MmapMut, MmapOptions};
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use syncd::ignore::Ignore;
-use syncd::{init, proto, shasum_bytes, transport};
+use syncd::{init, proto, shasum_bytes, transport, BoxAsynRead, BoxAsynWrite};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_tower::pipeline;
 use tower::Service;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+const FILE_CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
 
 /// Transfer directory structure via transfer-handler
 #[derive(Debug, FromArgs)]
 struct Args {
     /// client command to start
     #[argh(option)]
-    handler_cmd: String,
+    handler_cmd: Option<String>,
+    /// TCP socket to connect to
+    #[argh(option)]
+    connect: Option<String>,
     #[argh(option)]
     /// directory to transfer [default: current working directory]
     root: Option<PathBuf>,
+    /// include hidden files and directories
+    #[argh(switch)]
+    hidden: bool,
     /// where to transfer files
     #[argh(positional)]
     dest: PathBuf,
@@ -38,35 +48,48 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args: Args = init();
 
-    let mut client = Command::new(&args.handler_cmd)
-        .arg(&args.dest)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let stdin = client
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("failed to open stdin of client"))?;
-    let stdout = client
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to open stdout of client"))?;
+    let (read, write): (BoxAsynRead, BoxAsynWrite) = if let Some(handler_cmd) = args.handler_cmd {
+        let mut client = Command::new(&handler_cmd)
+            .arg(&args.dest)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let stdin = client
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open stdin of client"))?;
+        let stdout = client
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("failed to open stdout of client"))?;
+        (Box::pin(stdout), Box::pin(stdin))
+    } else if let Some(connect) = args.connect {
+        let stream = TcpStream::connect(connect).await?;
+        let (read, write) = stream.into_split();
+        (Box::pin(read), Box::pin(write))
+    } else {
+        bail!("either --handler-cmd or --socket must be specified");
+    };
+
     let transport =
         transport::BincodeTransport::<proto::TransferResponse, proto::TransferRequest, _, _>::new(
-            stdout, stdin,
+            read, write,
         );
-    let mut client = pipeline::Client::<_, tokio_tower::Error<_, _>, _>::new(transport);
+    let mut client = pipeline::Client::<_, tokio_tower::Error<_, _>, _>::with_error_handler(
+        transport,
+        |e| error!(reason = %e, "client failed"),
+    );
 
     let dir = args
         .root
         .map(Ok)
         .unwrap_or_else(current_dir)
         .context("failed to use current working directory as root")?;
+    let dir = dir.canonicalize()?;
 
     info!("initial sync");
-    initial_sync(&dir, &mut client).await?;
+    initial_sync(&dir, &mut client, args.hidden).await?;
 
-    info!(dir = %dir.display(), "watching");
     let (tx, mut rx) = mpsc::channel(1);
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = tx.blocking_send(event);
@@ -75,45 +98,215 @@ async fn main() -> anyhow::Result<()> {
     watcher
         .watch(&dir, RecursiveMode::Recursive)
         .context("failed to initialize watcher")?;
+    info!(dir = %dir.display(), "watching");
 
     let ignore = Ignore::build(&dir)?;
 
     while let Some(event) = rx.recv().await {
         let event = event.context("watcher failed")?;
-        match event.kind {
-            EventKind::Create(_) => (),
-            EventKind::Modify(_) => (),
-            EventKind::Remove(_) => (),
-            other => {
-                debug!(kind = ?other, "skipping event");
-                continue;
+        match handle_fs_event(&mut client, &ignore, event, &dir).await {
+            Ok(Ok(())) => (),
+            Ok(e) => return e, // fatal error
+            Err(e) => {
+                // handling error
+                warn!(reason = %e, "event handler failed");
             }
         }
-
-        if event.paths.iter().any(|p| ignore.should_skip_path(p)) {
-            debug!(?event, "ignore");
-            continue;
-        }
-
-        info!(?event, "watch notification");
     }
 
     Ok(())
 }
 
-async fn initial_sync<E, S>(dir: &Path, client: &mut S) -> anyhow::Result<()>
+async fn handle_fs_event<E, S>(
+    client: &mut S,
+    ignore: &Ignore,
+    event: Event,
+    root: &Path,
+) -> anyhow::Result<anyhow::Result<()>>
 where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    for entry in Walk::new(dir) {
+    match event.kind {
+        EventKind::Create(CreateKind::Folder) => {
+            handle_event_create_dir(event, ignore, client, root).await
+        }
+        EventKind::Create(CreateKind::File) => {
+            handle_event_create_file(event, ignore, client, root).await
+        }
+        EventKind::Modify(ModifyKind::Data(_)) => {
+            handle_event_modify_file(event, ignore, client, root).await
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            handle_event_rename(event, ignore, client).await
+        }
+        EventKind::Remove(RemoveKind::Folder) => {
+            handle_event_remove(event, ignore, client, true).await
+        }
+        EventKind::Remove(RemoveKind::File) => {
+            handle_event_remove(event, ignore, client, false).await
+        }
+        other => {
+            debug!(kind = ?other, "skipping event");
+            Ok(Ok(()))
+        }
+    }
+}
+
+async fn handle_event_create_dir<E, S>(
+    event: Event,
+    ignore: &Ignore,
+    client: &mut S,
+    root: &Path,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    let path = event
+        .paths
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("missing path in event"))?;
+    if ignore.should_skip_path(&path) {
+        return Ok(Ok(()));
+    }
+
+    check_dir(client, root, &path).await
+}
+
+async fn handle_event_create_file<E, S>(
+    event: Event,
+    ignore: &Ignore,
+    client: &mut S,
+    root: &Path,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    let path = event
+        .paths
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("missing path in event"))?;
+    if ignore.should_skip_path(&path) {
+        return Ok(Ok(()));
+    }
+
+    transfer_contents(client, root, &path).await
+}
+
+async fn handle_event_remove<E, S>(
+    event: Event,
+    ignore: &Ignore,
+    client: &mut S,
+    is_dir: bool,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    let path = event
+        .paths
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("missing path in event"))?;
+    if ignore.should_skip_path(&path) {
+        return Ok(Ok(()));
+    }
+
+    let file_type = if is_dir {
+        proto::FileType::Dir
+    } else {
+        proto::FileType::File
+    };
+
+    let req = proto::TransferRequest {
+        id: Uuid::new_v4(),
+        path,
+        file_type,
+        kind: proto::TransferRequestKind::Remove,
+        transfer: None,
+    };
+
+    if let Err(e) = send(client, req).await {
+        return Ok(Err(e.into()));
+    }
+    Ok(Ok(()))
+}
+
+async fn handle_event_rename<E, S>(
+    event: Event,
+    ignore: &Ignore,
+    client: &mut S,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    let mut paths = event.paths.into_iter();
+    let (from, to) = (
+        paths
+            .next()
+            .ok_or_else(|| anyhow!("missing path in event"))?,
+        paths
+            .next()
+            .ok_or_else(|| anyhow!("missing path in event"))?,
+    );
+
+    if ignore.should_skip_path(&from) && ignore.should_skip_path(&to) {
+        return Ok(Ok(()));
+    }
+
+    let req = proto::TransferRequest {
+        id: Uuid::new_v4(),
+        path: from,
+        file_type: proto::FileType::File, // does not matter
+        kind: proto::TransferRequestKind::Rename { new_path: to },
+        transfer: None,
+    };
+
+    send_request(client, req).await
+}
+
+async fn handle_event_modify_file<E, S>(
+    event: Event,
+    ignore: &Ignore,
+    client: &mut S,
+    root: &Path,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    let path = event
+        .paths
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("missing path in event"))?;
+    if ignore.should_skip_path(&path) {
+        return Ok(Ok(()));
+    }
+
+    check_file(client, root, &path).await
+}
+
+async fn initial_sync<E, S>(dir: &Path, client: &mut S, include_hidden: bool) -> anyhow::Result<()>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    let mut builder = WalkBuilder::new(dir);
+    builder.hidden(!include_hidden);
+    let walk = builder.build();
+
+    for entry in walk {
         match entry {
             Ok(entry) => {
                 match handle_entry(client, dir, &entry).await {
                     Ok(Ok(())) => (),
-                    Ok(Err(e)) => {
-                        return Err(e); // fatal error
-                    }
+                    Ok(e) => return e, // fatal error
                     Err(e) => {
                         // handling error
                         warn!(path = %entry.path().display(), reason = %e, "skipping");
@@ -133,7 +326,6 @@ where
 ///
 /// The inner (wrapped) result is fatal and comes from the service. It should be considered as
 /// non-recoverable.
-// TODO: We could use state classes to describe the protocol.
 async fn handle_entry<S, E>(
     client: &mut S,
     root: &Path,
@@ -143,120 +335,265 @@ where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    info!(path = %entry.path().display(), "check");
-
+    let path = entry.path();
     let metadata = entry.metadata()?;
     let file_type = proto::FileType::from_fs(metadata.file_type())
         .ok_or_else(|| anyhow!("unknown file type"))?;
-
-    let (transfer, mmap) = match file_type {
-        proto::FileType::Dir => (None, None),
-        proto::FileType::File => {
-            // Safely: since we assume that files are actively modified all the time, we have
-            // to memory map the file as copy-on-write.
-            //
-            // Note: The fd does not have to be kept open:
-            //
-            // * https://linux.die.net/man/2/mmap
-            // * https://pubs.opengroup.org/onlinepubs/7908799/xsh/mmap.html
-            let mmap = unsafe { MmapOptions::new().map_copy(&File::open(entry.path())?)? };
-            let shasum = shasum_bytes(&mmap);
-            (
-                Some(proto::Transfer {
-                    data: Default::default(),
-                    kind: proto::TransferKind::Empty,
-                    shasum,
-                    len: None,
-                }),
-                Some(mmap),
-            )
-        }
-        proto::FileType::Symlink => bail!("symlink unimplemented"),
-    };
-    let shasum = transfer.as_ref().map(|t| t.shasum);
-
-    let relative_path = entry.path().strip_prefix(root)?;
-    let mut req = proto::TransferRequest {
-        id: Uuid::new_v4(),
-        path: relative_path.into(),
-        file_type,
-        kind: proto::TransferRequestKind::Check,
-        transfer,
-    };
-
-    // protocol has max 2 requests depth
-    for _ in 1..3 {
-        let resp = match call(client, req).await {
-            Ok(resp) => resp,
-            Err(e) => return Ok(Err(e.into())),
-        };
-
-        req = match resp.kind {
-            proto::TransferResponseKind::Exists => return Ok(Ok(())),
-            proto::TransferResponseKind::Created => {
-                info!(path = %entry.path().display(), "created");
-                return Ok(Ok(()));
-            }
-            proto::TransferResponseKind::ExistsDifferent { signature } => {
-                let mmap = mmap
-                    .as_ref()
-                    .expect("logic error: mmap not set for file transfer");
-                let shasum = shasum.expect("logic error: shasum not set for for file transfer");
-
-                let sig = Signature::deserialize(&signature)?;
-                let mut delta = Vec::new();
-                diff(&sig.index(), mmap, &mut delta)?;
-
-                proto::TransferRequest {
-                    id: Uuid::new_v4(),
-                    path: relative_path.into(),
-                    file_type,
-                    kind: proto::TransferRequestKind::Delta,
-                    transfer: Some(proto::Transfer {
-                        kind: proto::TransferKind::Delta,
-                        data: delta,
-                        shasum,
-                        len: Some(mmap.len()),
-                    }),
-                }
-            }
-            proto::TransferResponseKind::NeedContents => {
-                let mmap = mmap
-                    .as_ref()
-                    .expect("logic error: mmap not set for file transfer");
-                let shasum = shasum.expect("logic error: shasum not set for for file transfer");
-                proto::TransferRequest {
-                    id: Uuid::new_v4(),
-                    path: relative_path.into(),
-                    file_type,
-                    kind: proto::TransferRequestKind::Contents,
-                    transfer: Some(proto::Transfer {
-                        kind: proto::TransferKind::Contents,
-                        data: mmap.to_vec(),
-                        shasum,
-                        len: None,
-                    }),
-                }
-            }
-            proto::TransferResponseKind::CantHandle { reason } => {
-                bail!("handler failed: {}", reason);
-            }
-        };
+    match file_type {
+        proto::FileType::Dir => check_dir(client, root, path).await,
+        proto::FileType::File => check_file(client, root, path).await,
+        proto::FileType::Symlink => bail!("symlinks are not supported"),
     }
-
-    Ok(Err(anyhow!("giving up")))
 }
 
-async fn call<Req, S>(svc: &mut S, req: Req) -> Result<S::Response, S::Error>
+async fn check_dir<S, E>(
+    client: &mut S,
+    root: &Path,
+    path: &Path,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    info!(path = %path.display(), "transfer");
+
+    let relative_path = path.strip_prefix(root)?;
+    let req = proto::TransferRequest {
+        id: Uuid::new_v4(),
+        path: relative_path.into(),
+        file_type: proto::FileType::Dir,
+        kind: proto::TransferRequestKind::Check,
+        transfer: None,
+    };
+
+    send_request(client, req).await
+}
+
+async fn check_file<S, E>(
+    client: &mut S,
+    root: &Path,
+    path: &Path,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    info!(path = %path.display(), "transfer");
+
+    let (mmap, shasum) = mmap(path)?;
+
+    let relative_path = path.strip_prefix(root)?;
+
+    let transfer = proto::Transfer {
+        data: Vec::new(),
+        kind: proto::TransferKind::Empty,
+        shasum,
+        file_size: None,
+        data_size: None,
+    };
+    let req = proto::TransferRequest {
+        id: Uuid::new_v4(),
+        path: relative_path.into(),
+        file_type: proto::FileType::File,
+        kind: proto::TransferRequestKind::Check,
+        transfer: Some(transfer),
+    };
+
+    let resp = match send(client, req).await {
+        Ok(resp) => resp,
+        Err(e) => return Ok(Err(e.into())),
+    };
+
+    match resp.kind {
+        proto::TransferResponseKind::Ok => Ok(Ok(())),
+        proto::TransferResponseKind::Different { signature } => {
+            transfer_delta_with_mmap(client, root, path, mmap, shasum, signature).await
+        }
+        proto::TransferResponseKind::NeedContents => {
+            transfer_contents_with_mmap(client, root, path, mmap, shasum).await
+        }
+        proto::TransferResponseKind::CantHandle { reason } => {
+            bail!("handler failed: {}", reason);
+        }
+    }
+}
+
+async fn transfer_contents<S, E>(
+    client: &mut S,
+    root: &Path,
+    path: &Path,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    let (mmap, shasum) = mmap(path)?;
+    transfer_contents_with_mmap(client, root, path, mmap, shasum).await
+}
+
+async fn transfer_contents_with_mmap<S, E>(
+    client: &mut S,
+    root: &Path,
+    path: &Path,
+    mmap: MmapMut,
+    shasum: [u8; 32],
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    let relative_path = path.strip_prefix(root)?;
+
+    for (n, chunk) in mmap.chunks(FILE_CHUNK_SIZE).enumerate() {
+        debug!(path = %path.display(), chunk = n, "transfer chunk");
+        let file_size = mmap.len();
+        let transfer = proto::Transfer {
+            data: chunk.to_vec(),
+            kind: proto::TransferKind::Contents,
+            shasum,
+            file_size: Some(file_size),
+            data_size: Some(file_size),
+        };
+        let req = proto::TransferRequest {
+            id: Uuid::new_v4(),
+            path: relative_path.into(),
+            file_type: proto::FileType::File,
+            kind: proto::TransferRequestKind::Contents,
+            transfer: Some(transfer),
+        };
+
+        if let Err(e) = send_request(client, req).await? {
+            return Ok(Err(e));
+        }
+    }
+
+    Ok(Ok(()))
+}
+
+async fn transfer_delta_with_mmap<S, E>(
+    client: &mut S,
+    root: &Path,
+    path: &Path,
+    mmap: MmapMut,
+    shasum: [u8; 32],
+    signature: Vec<u8>,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    let sig = Signature::deserialize(&signature)?;
+    let mut delta = Vec::new();
+    diff(&sig.index(), &mmap, &mut delta)?;
+
+    let relative_path = path.strip_prefix(root)?;
+
+    let chunks = delta.chunks(FILE_CHUNK_SIZE);
+    let num_chunks = chunks.len();
+
+    let mut needs_contents = false;
+
+    for (n, chunk) in chunks.enumerate() {
+        debug!(path = %path.display(), chunk = n, "transfer chunk");
+        let transfer = proto::Transfer {
+            kind: proto::TransferKind::Delta,
+            data: chunk.to_vec(),
+            shasum,
+            file_size: Some(mmap.len()),
+            data_size: Some(delta.len()),
+        };
+        let req = proto::TransferRequest {
+            id: Uuid::new_v4(),
+            path: relative_path.into(),
+            file_type: proto::FileType::File,
+            kind: proto::TransferRequestKind::Delta,
+            transfer: Some(transfer),
+        };
+
+        match send(client, req).await {
+            Ok(proto::TransferResponse {
+                kind: proto::TransferResponseKind::Ok,
+                ..
+            }) => (),
+            Ok(proto::TransferResponse {
+                kind: proto::TransferResponseKind::NeedContents,
+                ..
+            }) if n + 1 == num_chunks => {
+                // apply delta failed
+                needs_contents = true;
+            }
+            Ok(proto::TransferResponse {
+                kind: proto::TransferResponseKind::CantHandle { reason },
+                ..
+            }) => bail!("handler failed: {}", reason),
+            Ok(resp) => {
+                return Ok(Err(anyhow!(
+                    "protocol violation: got {:?} for chunk {}/{}",
+                    resp.kind,
+                    n,
+                    num_chunks
+                )))
+            }
+            Err(e) => return Ok(Err(e.into())),
+        }
+    }
+
+    if needs_contents {
+        transfer_contents_with_mmap(client, root, path, mmap, shasum).await
+    } else {
+        Ok(Ok(()))
+    }
+}
+
+/// Sends requests and waits for success response.
+///
+/// If the client fails, or protocol is violated, returns an inner error. When client received the
+/// request, but reports an error for handling it, returns it as an outer error.
+async fn send_request<E, S>(
+    client: &mut S,
+    req: proto::TransferRequest,
+) -> anyhow::Result<anyhow::Result<()>>
+where
+    E: std::error::Error + Sync + Send + 'static,
+    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
+{
+    Ok(match send(client, req).await {
+        Ok(proto::TransferResponse {
+            kind: proto::TransferResponseKind::Ok,
+            ..
+        }) => Ok(()),
+        Ok(proto::TransferResponse {
+            kind: proto::TransferResponseKind::CantHandle { reason },
+            ..
+        }) => bail!("handler failed: {}", reason),
+        Ok(resp) => Err(anyhow!("protocol violation: got {:?}", resp.kind)),
+        Err(e) => Err(e.into()),
+    })
+}
+
+async fn send<Req, S>(svc: &mut S, req: Req) -> Result<S::Response, S::Error>
 where
     Req: Debug,
     S: Service<Req>,
     S::Response: Debug,
     S::Error: Debug,
 {
-    debug!(?req, "send");
+    // trace!(?req, "send");
     poll_fn(|cx| svc.poll_ready(cx)).await?;
     let resp = svc.call(req).await;
-    debug!(?resp, "received");
+    // trace!(?resp, "received");
     resp
+}
+
+fn mmap(path: &Path) -> anyhow::Result<(MmapMut, [u8; 32])> {
+    // Safety: since we assume that files are actively modified all the time, we have
+    // to memory map the file as copy-on-write.
+    //
+    // Note: The fd does not have to be kept open:
+    //
+    // * https://linux.die.net/man/2/mmap
+    // * https://pubs.opengroup.org/onlinepubs/7908799/xsh/mmap.html
+    let mmap = unsafe { MmapOptions::new().map_copy(&File::open(path)?)? };
+    let shasum = shasum_bytes(&mmap);
+    Ok((mmap, shasum))
 }
