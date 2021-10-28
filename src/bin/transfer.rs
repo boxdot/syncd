@@ -100,7 +100,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize watcher")?;
     info!(dir = %dir.display(), "watching");
 
-    let ignore = Ignore::build(&dir)?;
+    let ignore = Ignore::build(&dir, !args.hidden)?;
+    debug!(?ignore, "ignore list");
 
     while let Some(event) = rx.recv().await {
         let event = event.context("watcher failed")?;
@@ -113,7 +114,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-
     Ok(())
 }
 
@@ -127,101 +127,61 @@ where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    match event.kind {
-        EventKind::Create(CreateKind::Folder) => {
-            handle_event_create_dir(event, ignore, client, root).await
+    let mut paths = event.paths.into_iter();
+    let p1 = paths.next();
+    let p2 = paths.next();
+
+    match (event.kind, p1, p2) {
+        (EventKind::Create(CreateKind::Folder), Some(path), _)
+            if !ignore.should_skip_path(&path) =>
+        {
+            info!(path = %path.display(), "create dir");
+            check_dir(client, root, &path).await
         }
-        EventKind::Create(CreateKind::File) => {
-            handle_event_create_file(event, ignore, client, root).await
+        (EventKind::Create(CreateKind::File), Some(path), _) if !ignore.should_skip_path(&path) => {
+            info!(path = %path.display(), "create file");
+            transfer_contents(client, root, &path).await
         }
-        EventKind::Modify(ModifyKind::Data(_)) => {
-            handle_event_modify_file(event, ignore, client, root).await
+        (EventKind::Modify(ModifyKind::Data(_)), Some(path), _)
+            if !ignore.should_skip_path(&path) =>
+        {
+            info!(path = %path.display(), "modify");
+            check_file(client, root, &path).await
         }
-        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
-            handle_event_rename(event, ignore, client).await
+        (EventKind::Modify(ModifyKind::Name(RenameMode::Both)), Some(from), Some(to))
+            if !ignore.should_skip_path(&from) && !ignore.should_skip_path(&to) =>
+        {
+            info!(from = %from.display(), to = %to.display(), "rename");
+            handle_event_rename(client, from, to).await
         }
-        EventKind::Remove(RemoveKind::Folder) => {
-            handle_event_remove(event, ignore, client, true).await
+        (EventKind::Remove(RemoveKind::Folder), Some(path), _)
+            if !ignore.should_skip_path(&path) =>
+        {
+            info!(path = %path.display(), "remove dir");
+            handle_event_remove(client, path, true).await
         }
-        EventKind::Remove(RemoveKind::File) => {
-            handle_event_remove(event, ignore, client, false).await
+        (EventKind::Remove(RemoveKind::File), Some(path), _) if !ignore.should_skip_path(&path) => {
+            info!(path = %path.display(), "remove file");
+            handle_event_remove(client, path, false).await
         }
-        other => {
-            debug!(kind = ?other, "skipping event");
-            Ok(Ok(()))
-        }
+        _ => Ok(Ok(())),
     }
-}
-
-async fn handle_event_create_dir<E, S>(
-    event: Event,
-    ignore: &Ignore,
-    client: &mut S,
-    root: &Path,
-) -> anyhow::Result<anyhow::Result<()>>
-where
-    E: std::error::Error + Sync + Send + 'static,
-    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
-{
-    let path = event
-        .paths
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("missing path in event"))?;
-    if ignore.should_skip_path(&path) {
-        return Ok(Ok(()));
-    }
-
-    check_dir(client, root, &path).await
-}
-
-async fn handle_event_create_file<E, S>(
-    event: Event,
-    ignore: &Ignore,
-    client: &mut S,
-    root: &Path,
-) -> anyhow::Result<anyhow::Result<()>>
-where
-    E: std::error::Error + Sync + Send + 'static,
-    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
-{
-    let path = event
-        .paths
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("missing path in event"))?;
-    if ignore.should_skip_path(&path) {
-        return Ok(Ok(()));
-    }
-
-    transfer_contents(client, root, &path).await
 }
 
 async fn handle_event_remove<E, S>(
-    event: Event,
-    ignore: &Ignore,
     client: &mut S,
+    path: PathBuf,
     is_dir: bool,
 ) -> anyhow::Result<anyhow::Result<()>>
 where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    let path = event
-        .paths
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("missing path in event"))?;
-    if ignore.should_skip_path(&path) {
-        return Ok(Ok(()));
-    }
-
     let file_type = if is_dir {
         proto::FileType::Dir
     } else {
         proto::FileType::File
     };
-
     let req = proto::TransferRequest {
         id: Uuid::new_v4(),
         path,
@@ -229,36 +189,18 @@ where
         kind: proto::TransferRequestKind::Remove,
         transfer: None,
     };
-
-    if let Err(e) = send(client, req).await {
-        return Ok(Err(e.into()));
-    }
-    Ok(Ok(()))
+    send_request(client, req).await
 }
 
 async fn handle_event_rename<E, S>(
-    event: Event,
-    ignore: &Ignore,
     client: &mut S,
+    from: PathBuf,
+    to: PathBuf,
 ) -> anyhow::Result<anyhow::Result<()>>
 where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    let mut paths = event.paths.into_iter();
-    let (from, to) = (
-        paths
-            .next()
-            .ok_or_else(|| anyhow!("missing path in event"))?,
-        paths
-            .next()
-            .ok_or_else(|| anyhow!("missing path in event"))?,
-    );
-
-    if ignore.should_skip_path(&from) && ignore.should_skip_path(&to) {
-        return Ok(Ok(()));
-    }
-
     let req = proto::TransferRequest {
         id: Uuid::new_v4(),
         path: from,
@@ -266,30 +208,7 @@ where
         kind: proto::TransferRequestKind::Rename { new_path: to },
         transfer: None,
     };
-
     send_request(client, req).await
-}
-
-async fn handle_event_modify_file<E, S>(
-    event: Event,
-    ignore: &Ignore,
-    client: &mut S,
-    root: &Path,
-) -> anyhow::Result<anyhow::Result<()>>
-where
-    E: std::error::Error + Sync + Send + 'static,
-    S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
-{
-    let path = event
-        .paths
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("missing path in event"))?;
-    if ignore.should_skip_path(&path) {
-        return Ok(Ok(()));
-    }
-
-    check_file(client, root, &path).await
 }
 
 async fn initial_sync<E, S>(dir: &Path, client: &mut S, include_hidden: bool) -> anyhow::Result<()>
@@ -340,8 +259,14 @@ where
     let file_type = proto::FileType::from_fs(metadata.file_type())
         .ok_or_else(|| anyhow!("unknown file type"))?;
     match file_type {
-        proto::FileType::Dir => check_dir(client, root, path).await,
-        proto::FileType::File => check_file(client, root, path).await,
+        proto::FileType::Dir => {
+            info!(path = %path.display(), "transfer dir");
+            check_dir(client, root, path).await
+        }
+        proto::FileType::File => {
+            info!(path = %path.display(), "transfer file");
+            check_file(client, root, path).await
+        }
         proto::FileType::Symlink => bail!("symlinks are not supported"),
     }
 }
@@ -355,8 +280,6 @@ where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    info!(path = %path.display(), "transfer");
-
     let relative_path = path.strip_prefix(root)?;
     let req = proto::TransferRequest {
         id: Uuid::new_v4(),
@@ -378,8 +301,6 @@ where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    info!(path = %path.display(), "transfer");
-
     let (mmap, shasum) = mmap(path)?;
 
     let relative_path = path.strip_prefix(root)?;
