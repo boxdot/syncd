@@ -1,6 +1,5 @@
 use std::env::current_dir;
 use std::fmt::Debug;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -9,11 +8,11 @@ use argh::FromArgs;
 use fast_rsync::{diff, Signature};
 use futures_util::future::poll_fn;
 use ignore::{DirEntry, WalkBuilder};
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::Mmap;
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use syncd::ignore::Ignore;
-use syncd::{init, proto, shasum_bytes, transport, BoxAsynRead, BoxAsynWrite};
+use syncd::{init, mmap_with_shasum, proto, transport, BoxAsynRead, BoxAsynWrite};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -30,6 +29,9 @@ struct Args {
     /// client command to start
     #[argh(option)]
     handler_cmd: Option<String>,
+    /// where to transfer files
+    #[argh(option)]
+    dest: Option<PathBuf>,
     /// TCP socket to connect to
     #[argh(option)]
     connect: Option<String>,
@@ -39,9 +41,6 @@ struct Args {
     /// include hidden files and directories
     #[argh(switch)]
     hidden: bool,
-    /// where to transfer files
-    #[argh(positional)]
-    dest: PathBuf,
 }
 
 #[tokio::main]
@@ -49,8 +48,11 @@ async fn main() -> anyhow::Result<()> {
     let args: Args = init();
 
     let (read, write): (BoxAsynRead, BoxAsynWrite) = if let Some(handler_cmd) = args.handler_cmd {
+        let dest = args
+            .dest
+            .ok_or_else(|| anyhow!("--dest has to be provided when using --handler-cmd"))?;
         let mut client = Command::new(&handler_cmd)
-            .arg(&args.dest)
+            .arg(dest)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
@@ -127,11 +129,11 @@ where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    let mut paths = event.paths.into_iter();
+    let mut paths = event.paths.clone().into_iter();
     let p1 = paths.next();
     let p2 = paths.next();
 
-    match (event.kind, p1, p2) {
+    match (event.kind.clone(), p1, p2) {
         (EventKind::Create(CreateKind::Folder), Some(path), _)
             if !ignore.should_skip_path(&path) =>
         {
@@ -148,11 +150,23 @@ where
             info!(path = %path.display(), "modify");
             check_file(client, root, &path).await
         }
-        (EventKind::Modify(ModifyKind::Name(RenameMode::Both)), Some(from), Some(to))
-            if !ignore.should_skip_path(&from) && !ignore.should_skip_path(&to) =>
-        {
-            info!(from = %from.display(), to = %to.display(), "rename");
-            handle_event_rename(client, from, to).await
+        (EventKind::Modify(ModifyKind::Name(RenameMode::Both)), Some(from), Some(to)) => {
+            let is_dir = from.is_dir();
+            if ignore.should_skip_path(&from) && !ignore.should_skip_path(&to) {
+                if is_dir {
+                    info!(path = %to.display(), "create dir");
+                    check_dir(client, root, &to).await
+                } else {
+                    info!(path = %to.display(), "modify");
+                    check_file(client, root, &to).await
+                }
+            } else if !ignore.should_skip_path(&to) {
+                info!(from = %from.display(), to = %to.display(), "rename");
+                handle_event_rename(client, from, to).await
+            } else {
+                debug!(?event, "skipping");
+                Ok(Ok(()))
+            }
         }
         (EventKind::Remove(RemoveKind::Folder), Some(path), _)
             if !ignore.should_skip_path(&path) =>
@@ -164,7 +178,10 @@ where
             info!(path = %path.display(), "remove file");
             handle_event_remove(client, path, false).await
         }
-        _ => Ok(Ok(())),
+        _ => {
+            debug!(?event, "skipping");
+            Ok(Ok(()))
+        }
     }
 }
 
@@ -301,7 +318,7 @@ where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    let (mmap, shasum) = mmap(path)?;
+    let (mmap, shasum) = mmap_with_shasum(path)?;
 
     let relative_path = path.strip_prefix(root)?;
 
@@ -348,7 +365,7 @@ where
     E: std::error::Error + Sync + Send + 'static,
     S: Service<proto::TransferRequest, Response = proto::TransferResponse, Error = E>,
 {
-    let (mmap, shasum) = mmap(path)?;
+    let (mmap, shasum) = mmap_with_shasum(path)?;
     transfer_contents_with_mmap(client, root, path, mmap, shasum).await
 }
 
@@ -356,7 +373,7 @@ async fn transfer_contents_with_mmap<S, E>(
     client: &mut S,
     root: &Path,
     path: &Path,
-    mmap: MmapMut,
+    mmap: Mmap,
     shasum: [u8; 32],
 ) -> anyhow::Result<anyhow::Result<()>>
 where
@@ -395,7 +412,7 @@ async fn transfer_delta_with_mmap<S, E>(
     client: &mut S,
     root: &Path,
     path: &Path,
-    mmap: MmapMut,
+    mmap: Mmap,
     shasum: [u8; 32],
     signature: Vec<u8>,
 ) -> anyhow::Result<anyhow::Result<()>>
@@ -504,17 +521,4 @@ where
     let resp = svc.call(req).await;
     // trace!(?resp, "received");
     resp
-}
-
-fn mmap(path: &Path) -> anyhow::Result<(MmapMut, [u8; 32])> {
-    // Safety: since we assume that files are actively modified all the time, we have
-    // to memory map the file as copy-on-write.
-    //
-    // Note: The fd does not have to be kept open:
-    //
-    // * https://linux.die.net/man/2/mmap
-    // * https://pubs.opengroup.org/onlinepubs/7908799/xsh/mmap.html
-    let mmap = unsafe { MmapOptions::new().map_copy(&File::open(path)?)? };
-    let shasum = shasum_bytes(&mmap);
-    Ok((mmap, shasum))
 }

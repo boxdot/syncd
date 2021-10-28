@@ -14,26 +14,42 @@ use tokio::{fs, io};
 #[derive(Debug, Default)]
 pub struct Store {
     files: HashMap<PathBuf, FileEntry>,
-    deltas: HashMap<PathBuf, Vec<u8>>,
+    deltas: HashMap<PathBuf, DeltaEntry>,
 }
 
 impl Store {
     /// Returns the number of total bytes written to the file so far.
-    pub async fn push_file_chunk(&mut self, path: PathBuf, data: &[u8]) -> io::Result<u64> {
+    pub async fn push_file_chunk(
+        &mut self,
+        path: PathBuf,
+        shasum: [u8; 32],
+        data: &[u8],
+    ) -> io::Result<u64> {
         let mut entry = self.files.entry(path.clone());
         let mut file_entry = match entry {
             hash_map::Entry::Occupied(ref mut entry) => entry.get_mut(),
-            hash_map::Entry::Vacant(entry) => entry.insert(FileEntry::new(&path).await?),
+            hash_map::Entry::Vacant(entry) => entry.insert(FileEntry::new(&path, shasum).await?),
         };
+        if file_entry.shasum != shasum {
+            // shasum changed => reset file entry
+            *file_entry = FileEntry::new(&path, shasum).await?;
+        }
         file_entry.write_all(data).await?;
         file_entry.num_bytes += data.len() as u64;
         Ok(file_entry.num_bytes)
     }
 
-    pub fn push_delta_chunk(&mut self, path: PathBuf, data: &[u8]) -> &[u8] {
-        let delta = self.deltas.entry(path).or_default();
-        delta.extend(data);
-        delta
+    pub fn push_delta_chunk(&mut self, path: PathBuf, shasum: [u8; 32], data: &[u8]) -> &[u8] {
+        let delta_entry = self.deltas.entry(path).or_insert_with(|| DeltaEntry {
+            shasum,
+            delta: Vec::new(),
+        });
+        if shasum != delta_entry.shasum {
+            // shasum changed => reset delta
+            delta_entry.delta.clear();
+        }
+        delta_entry.delta.extend(data);
+        &delta_entry.delta
     }
 
     /// Returns the sha256 sum of the file if the file was in the store.
@@ -59,14 +75,17 @@ impl Store {
 struct FileEntry {
     #[pin]
     f: io::BufWriter<fs::File>,
+    /// expected sha256 sum of the final data
+    shasum: [u8; 32],
     hasher: Sha256,
     num_bytes: u64,
 }
 
 impl FileEntry {
-    pub async fn new(path: &Path) -> io::Result<Self> {
+    pub async fn new(path: &Path, shasum: [u8; 32]) -> io::Result<Self> {
         Ok(Self {
             f: io::BufWriter::new(fs::File::create(path).await?),
+            shasum,
             hasher: Default::default(),
             num_bytes: 0,
         })
@@ -94,4 +113,10 @@ impl AsyncWrite for FileEntry {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         self.project().f.poll_shutdown(cx)
     }
+}
+
+#[derive(Debug)]
+struct DeltaEntry {
+    shasum: [u8; 32],
+    delta: Vec<u8>,
 }

@@ -22,8 +22,9 @@ impl<W: io::Write> WriterWithShasum<W> {
 
 impl<W: io::Write> io::Write for WriterWithShasum<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.hasher.update(buf);
-        self.writer.write(buf)
+        let n = self.writer.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {

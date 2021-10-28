@@ -10,13 +10,12 @@ use anyhow::{anyhow, bail, Context as _};
 use argh::FromArgs;
 use fast_rsync::{apply_limited, Signature, SignatureOptions};
 use futures_util::FutureExt;
-use memmap2::MmapOptions;
 use syncd::proto::{
     FileType, Transfer, TransferKind, TransferRequest, TransferResponse, TransferResponseKind,
 };
 use syncd::store::Store;
 use syncd::write::WriterWithShasum;
-use syncd::{init, proto, shasum_bytes, transport, BoxAsynRead, BoxAsynWrite};
+use syncd::{init, mmap, mmap_with_shasum, proto, transport, BoxAsynRead, BoxAsynWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tower::pipeline;
@@ -39,42 +38,52 @@ async fn main() -> anyhow::Result<()> {
 
     info!("waiting for connection");
 
-    let (read, write): (BoxAsynRead, BoxAsynWrite) = if let Some(listen) = args.listen {
-        let listener = TcpListener::bind(listen).await?;
-        let (socket, _addr) = listener.accept().await?;
-        let (read, write) = socket.into_split();
-        (Box::pin(read), (Box::pin(write)))
-    } else {
-        (Box::pin(tokio::io::stdin()), Box::pin(tokio::io::stdout()))
-    };
+    loop {
+        let (read, write): (BoxAsynRead, BoxAsynWrite) = if let Some(listen) = args.listen.as_ref()
+        {
+            let listener = TcpListener::bind(listen).await?;
+            let (socket, _addr) = listener.accept().await?;
+            let (read, write) = socket.into_split();
+            (Box::pin(read), (Box::pin(write)))
+        } else {
+            (Box::pin(tokio::io::stdin()), Box::pin(tokio::io::stdout()))
+        };
 
-    info!("connection accepted");
+        info!("connection accepted");
 
-    let transport =
-        transport::BincodeTransport::<proto::TransferRequest, proto::TransferResponse, _, _>::new(
-            read, write,
-        );
+        let transport = transport::BincodeTransport::<
+            proto::TransferRequest,
+            proto::TransferResponse,
+            _,
+            _,
+        >::new(read, write);
 
-    if !args.root.exists() {
-        fs::create_dir_all(&args.root)?;
-    } else if !args.root.is_dir() {
-        bail!("{} exists and is not a directory", args.root.display());
+        if !args.root.exists() {
+            fs::create_dir_all(&args.root)?;
+        } else if !args.root.is_dir() {
+            bail!("{} exists and is not a directory", args.root.display());
+        }
+
+        let cx = TransferHandlerContext {
+            root: Arc::new(args.root.clone()),
+            store: Default::default(),
+        };
+
+        let service = tower::service_fn(move |req| {
+            transfer_handler(cx.clone(), req).map(Ok::<_, Infallible>)
+        });
+
+        info!("running handler");
+
+        pipeline::Server::new(transport, service)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+            .context("handle-transfer server failed")?;
+
+        if args.listen.is_none() {
+            break;
+        }
     }
-
-    let cx = TransferHandlerContext {
-        root: Arc::new(args.root),
-        store: Default::default(),
-    };
-
-    let service =
-        tower::service_fn(move |req| transfer_handler(cx.clone(), req).map(Ok::<_, Infallible>));
-
-    info!("running handler");
-
-    pipeline::Server::new(transport, service)
-        .await
-        .map_err(|e| anyhow!(e.to_string()))
-        .context("handle-transfer server failed")?;
 
     info!("shutting down");
 
@@ -154,8 +163,7 @@ fn handle_check_file(path: &Path, transfer: Transfer) -> io::Result<TransferResp
     if !path.exists() {
         Ok(TransferResponseKind::NeedContents)
     } else {
-        let mmap = unsafe { MmapOptions::new().map_copy(&File::open(path)?)? };
-        let shasum = shasum_bytes(&mmap);
+        let (mmap, shasum) = mmap_with_shasum(path)?;
 
         if shasum == transfer.shasum {
             Ok(TransferResponseKind::Ok)
@@ -194,7 +202,9 @@ async fn handle_contents(
     debug!(path = %path.display(), file_size, "handle_contents");
 
     let mut store = cx.store.lock().await;
-    let total_bytes = store.push_file_chunk(path.clone(), &transfer.data).await?;
+    let total_bytes = store
+        .push_file_chunk(path.clone(), transfer.shasum, &transfer.data)
+        .await?;
     if total_bytes == file_size as u64 {
         // we got the last chunk
         let shasum = store
@@ -238,38 +248,41 @@ async fn handle_delta(
 
     let path = cx.root.join(req.path);
 
+    // TODO: optimize the case where the is only a single chunk
     let mut store = cx.store.lock().await;
-    let delta = store.push_delta_chunk(path.clone(), &transfer.data);
+    let delta = store.push_delta_chunk(path.clone(), transfer.shasum, &transfer.data);
 
-    if delta.len() == data_size {
-        // we got the last delta chunk
-
-        let mmap = unsafe { MmapOptions::new().map_copy(&File::open(&path)?)? };
-
-        // TODO: Use async if possible
-        let f = File::create(path)?;
-        let mut out = WriterWithShasum::new(BufWriter::new(f));
-        apply_limited(&mmap, &transfer.data, &mut out, file_size)?;
-        let shasum = out.finalize();
-
-        if shasum == transfer.shasum {
-            // apply worked
-            Ok(TransferResponse {
-                id: req.id,
-                kind: TransferResponseKind::Ok,
-            })
-        } else {
-            // apply failed => ask for the full contents
-            Ok(TransferResponse {
-                id: req.id,
-                kind: TransferResponseKind::NeedContents,
-            })
-        }
-    } else {
+    if delta.len() != data_size {
         // need more delta chunks
+        return Ok(TransferResponse {
+            id: req.id,
+            kind: TransferResponseKind::Ok,
+        });
+    }
+
+    // we got the last delta chunk
+    store.remove_delta(&path);
+    drop(store);
+
+    let mmap = mmap(&path)?;
+    fs::remove_file(&path)?; // unlink previous file to avoid overriding the mmap
+
+    let f = File::create(&path)?;
+    let mut out = WriterWithShasum::new(BufWriter::new(f));
+    apply_limited(&mmap, &transfer.data, &mut out, file_size)?;
+    let shasum = out.finalize();
+
+    if shasum == transfer.shasum {
+        // apply worked
         Ok(TransferResponse {
             id: req.id,
             kind: TransferResponseKind::Ok,
+        })
+    } else {
+        // apply failed => ask for the full contents
+        Ok(TransferResponse {
+            id: req.id,
+            kind: TransferResponseKind::NeedContents,
         })
     }
 }
