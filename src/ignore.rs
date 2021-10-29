@@ -1,9 +1,57 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use tracing::debug;
 
 use crate::pathutil;
+
+#[derive(Debug)]
+pub struct IgnoreBuilder {
+    root: PathBuf,
+    /// read rules from .ignore file
+    ignore_dot: bool,
+    /// ignore hidden files
+    hidden: bool,
+}
+
+impl IgnoreBuilder {
+    pub fn build(&self) -> Result<Ignore, ignore::Error> {
+        let (global_ignore, err) = GitignoreBuilder::new("").build_global();
+        if let Some(e) = err {
+            debug!(error = %e, "global gitignore failed")
+        }
+
+        let mut ignore_builder = GitignoreBuilder::new(&self.root);
+        if let Some(e) = ignore_builder.add(".gitignore") {
+            debug!(error = %e, ".gitignore failed");
+        }
+        if self.ignore_dot {
+            if let Some(e) = ignore_builder.add(".ignore") {
+                debug!(error = %e, ".ignore failed");
+            }
+        }
+        ignore_builder
+            .add_line(None, ".git/**/*.lock")
+            .expect("invalid rule");
+        let local_ignore = ignore_builder.build()?;
+
+        Ok(Ignore {
+            global_ignore,
+            local_ignore,
+            ignore_hidden: !self.hidden,
+        })
+    }
+
+    pub fn no_ignore_dot(&mut self, value: bool) -> &mut Self {
+        self.ignore_dot = !value;
+        self
+    }
+
+    pub fn hidden(&mut self, value: bool) -> &mut Self {
+        self.hidden = value;
+        self
+    }
+}
 
 #[derive(Debug)]
 pub struct Ignore {
@@ -14,29 +62,12 @@ pub struct Ignore {
 }
 
 impl Ignore {
-    pub fn build(root: &Path, ignore_hidden: bool) -> anyhow::Result<Self> {
-        let (global_ignore, err) = GitignoreBuilder::new("").build_global();
-        if let Some(e) = err {
-            debug!(error = %e, "global gitignore failed")
+    pub fn new(root: PathBuf) -> IgnoreBuilder {
+        IgnoreBuilder {
+            root,
+            ignore_dot: true,
+            hidden: true,
         }
-
-        let mut ignore_builder = GitignoreBuilder::new(root);
-        if let Some(e) = ignore_builder.add(".gitignore") {
-            debug!(error = %e, ".gitignore failed");
-        }
-        if let Some(e) = ignore_builder.add(".ignore") {
-            debug!(error = %e, ".ignore failed");
-        }
-        ignore_builder
-            .add_line(None, ".git/**/*.lock")
-            .expect("invalid rule");
-        let local_ignore = ignore_builder.build()?;
-
-        Ok(Self {
-            global_ignore,
-            local_ignore,
-            ignore_hidden,
-        })
     }
 
     pub fn should_skip_path(&self, path: &Path) -> bool {

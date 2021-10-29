@@ -41,6 +41,9 @@ struct Args {
     /// include hidden files and directories
     #[argh(switch)]
     hidden: bool,
+    /// don't respect .ignore files
+    #[argh(switch)]
+    no_ignore_dot: bool,
 }
 
 #[tokio::main]
@@ -102,7 +105,10 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize watcher")?;
     info!(dir = %dir.display(), "watching");
 
-    let ignore = Ignore::build(&dir, !args.hidden)?;
+    let ignore = Ignore::new(dir.clone())
+        .hidden(args.hidden)
+        .no_ignore_dot(args.no_ignore_dot)
+        .build()?;
     debug!(?ignore, "ignore list");
 
     while let Some(event) = rx.recv().await {
