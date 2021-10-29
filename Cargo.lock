@@ -927,6 +927,8 @@ dependencies = [
 [[package]]
 name = "tokio-tower"
 version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4322b6e2ebfd3be4082c16df4341505ef333683158b55f22afaf3f61565d728"
 dependencies = [
  "crossbeam",
  "futures-core",
